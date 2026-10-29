@@ -45,13 +45,16 @@ async function pollStatus(baseUrl, qrcode, verifyCode) {
   } catch { return { status: "wait" }; }
   finally { clearTimeout(t); }
 }
-function showQR(qrUrl) {
+async function showQR(qrUrl) {
   console.log("\n二维码链接: " + qrUrl);
-  execFile("qrencode", ["-o", QR_PNG, "-s", "12", "-m", "2", qrUrl], (err) => {
-    if (err) { console.log("(未能生成二维码图片，请把上面的链接发到另一台设备打开)"); return; }
+  try {
+    const QRCode = (await import("qrcode")).default;
+    await QRCode.toFile(QR_PNG, qrUrl, { width: 720, margin: 2 });
     console.log("二维码图片已生成，正在打开……请用 iPhone 上的微信扫描这台安卓机屏幕上的二维码。");
     execFile("termux-open", [QR_PNG], () => {});
-  });
+  } catch {
+    console.log("(二维码图片生成失败，请把上面的链接想办法发到另一台设备上打开/扫码)");
+  }
 }
 function askLine(prompt) {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
