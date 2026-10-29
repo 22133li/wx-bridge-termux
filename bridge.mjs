@@ -1,22 +1,25 @@
-// wx-bridge daemon (Termux): long-polls iLink getupdates, relays messages
-// to/from the private GitHub relay repo (22133li/wx-bridge-relay).
-// Zero dependencies (Node >= 18). Credentials live only on this phone:
+// wx-bridge daemon (Termux): long-polls iLink getupdates and relays messages
+// through a local git clone of the private relay repo (SSH deploy key auth).
+// Zero npm dependencies (Node >= 18). Credentials live only on this phone:
 //   ~/wx-bridge/state/account.json  (iLink bot token, from login.mjs)
-//   ~/wx-bridge/state/relay.json    ({"pat": "..."} GitHub fine-grained PAT)
-import { readFileSync, writeFileSync } from "node:fs";
+//   ~/.ssh/wxrelay                  (deploy key for the relay repo only)
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from "node:fs";
+import { execFile } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 
-const STATE = process.env.HOME + "/wx-bridge/state";
-const RELAY = "22133li/wx-bridge-relay";
+const HOME = process.env.HOME;
+const DIR = HOME + "/wx-bridge";
+const STATE = DIR + "/state";
+const RELAY_DIR = DIR + "/relay";
 const PLUGIN_VERSION = "2.4.10";
 const CLIENT_VERSION = (2 << 16) | (4 << 8) | 10; // 132106
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 const loadJson = (p) => JSON.parse(readFileSync(p, "utf8"));
 const saveJson = (p, o) => writeFileSync(p, JSON.stringify(o, null, 2), { mode: 0o600 });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const account = loadJson(STATE + "/account.json");
-const relay = loadJson(STATE + "/relay.json");
 const BASE = account.baseUrl || "https://ilinkai.weixin.qq.com";
 let syncBuf = "";
 try { syncBuf = loadJson(STATE + "/sync.json").get_updates_buf || ""; } catch {}
@@ -46,27 +49,24 @@ async function ilink(endpoint, body, timeoutMs = 45000) {
   } finally { clearTimeout(t); }
 }
 
-const GH = "https://api.github.com/repos/" + RELAY + "/contents";
-async function gh(method, path, body) {
-  const res = await fetch(GH + "/" + path, {
-    method,
-    headers: {
-      Authorization: "Bearer " + relay.pat,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "Content-Type": "application/json",
-      "User-Agent": "wx-bridge-termux",
-    },
-    body: body ? JSON.stringify(body) : undefined,
+// ---- git relay (serialized: one git operation at a time) ----
+const gitEnv = { ...process.env, GIT_SSH_COMMAND: "ssh -i " + HOME + "/.ssh/wxrelay -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" };
+function git(args) {
+  return new Promise((resolve, reject) => {
+    execFile("git", args, { cwd: RELAY_DIR, env: gitEnv }, (e, so, se) =>
+      e ? reject(new Error("git " + args.join(" ") + ": " + String(se).trim())) : resolve(String(so).trim()));
   });
-  if (res.status === 404) return null;
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error("GitHub " + method + " " + path + " -> " + res.status + " " + (data.message || ""));
-  return data;
 }
-const b64e = (s) => Buffer.from(s, "utf8").toString("base64");
-const b64d = (s) => Buffer.from(String(s).replace(/\n/g, ""), "base64").toString("utf8");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let chain = Promise.resolve();
+function withGit(fn) { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; }
+
+async function pullRebase() { await git(["pull", "--rebase", "origin", "main"]); }
+async function pushWithRetry() {
+  for (let i = 0; i < 3; i++) {
+    try { await git(["push", "origin", "main"]); return; }
+    catch (e) { if (i === 2) throw e; await pullRebase(); }
+  }
+}
 
 const pushed = new Set();
 async function pushInbox(msg) {
@@ -87,14 +87,17 @@ async function pushInbox(msg) {
     context_token: msg.context_token || "",
     ts: msg.create_time_ms || Date.now(),
   };
-  try {
-    await gh("PUT", "inbox/" + name, { message: "wx msg " + payload.id, content: b64e(JSON.stringify(payload)) });
-    log("📩 已转发到中继:", payload.text.slice(0, 80));
-  } catch (e) {
-    if (String(e.message).includes("422")) { /* already in relay */ }
-    else throw e;
-  }
+  await withGit(async () => {
+    await pullRebase();
+    const p = RELAY_DIR + "/inbox/" + name;
+    if (existsSync(p)) return;
+    writeFileSync(p, JSON.stringify(payload));
+    await git(["add", "inbox/" + name]);
+    await git(["commit", "-qm", "wx msg " + payload.id]);
+    await pushWithRetry();
+  });
   pushed.add(name);
+  log("📩 已转发到中继:", payload.text.slice(0, 80));
 }
 
 async function inboundLoop() {
@@ -126,17 +129,17 @@ async function inboundLoop() {
   }
 }
 
-const sentOut = new Set();
 async function outboundLoop() {
   for (;;) {
     try {
-      const list = await gh("GET", "outbox");
-      if (Array.isArray(list)) {
-        for (const f of list) {
-          if (f.name === ".gitkeep" || sentOut.has(f.name)) continue;
-          const file = await gh("GET", "outbox/" + f.name);
-          if (!file?.content) continue;
-          const job = JSON.parse(b64d(file.content));
+      await withGit(async () => {
+        await pullRebase();
+        const names = readdirSync(RELAY_DIR + "/outbox").filter((n) => n.endsWith(".json"));
+        const done = [];
+        for (const name of names) {
+          let job;
+          try { job = JSON.parse(readFileSync(RELAY_DIR + "/outbox/" + name, "utf8")); }
+          catch { continue; }
           const resp = await ilink("ilink/bot/sendmessage", {
             msg: {
               from_user_id: "",
@@ -149,16 +152,25 @@ async function outboundLoop() {
             },
           }, 30000);
           if (resp.ret && resp.ret !== 0) throw new Error("sendmessage ret=" + resp.ret + " " + (resp.errmsg || ""));
-          await gh("DELETE", "outbox/" + f.name, { message: "sent " + f.name, sha: file.sha });
-          sentOut.add(f.name);
+          done.push(name);
           log("📤 已发送回复:", String(job.text).slice(0, 80));
         }
-      }
+        if (done.length) {
+          for (const name of done) unlinkSync(RELAY_DIR + "/outbox/" + name);
+          await git(["add", "-A", "outbox"]);
+          await git(["commit", "-qm", "sent " + done.join(",")]);
+          await pushWithRetry();
+        }
+      });
     } catch (e) { log("outbox 轮询出错:", e.message); }
     await sleep(15000);
   }
 }
 
+if (!existsSync(RELAY_DIR + "/.git")) {
+  log("⛔ 中继仓库还没克隆，请先重新运行 start.sh");
+  process.exit(2);
+}
 log("wx-bridge 桥接启动，机器人:", account.botId || "(unknown)");
 inboundLoop();
 outboundLoop();
